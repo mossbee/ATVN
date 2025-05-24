@@ -1,0 +1,83 @@
+# Model Configuration
+model:
+  name: "ATVN"
+  backbone: "facenet"  # or "arcface"
+  pretrained: true
+  
+  # Attention Module Parameters
+  attention:
+    scales: [1, 2, 4]  # Multi-scale factors
+    channels: [256, 512, 1024]
+    dropout: 0.1
+    
+  # Feature Fusion Parameters
+  fusion:
+    attention_dim: 512
+    pretrained_dim: 512
+    output_dim: 512
+    fusion_type: "adaptive"  # "adaptive", "concat", "add"
+    
+  # Verification Head
+  head:
+    hidden_dims: [512, 256]
+    dropout: 0.2
+
+# Training Configuration
+training:
+  batch_size: 16
+  epochs: 100
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  scheduler: "cosine"
+  warmup_epochs: 5
+  
+  # Loss Configuration
+  loss:
+    contrastive_margin: 1.0
+    focal_alpha: 0.25
+    focal_gamma: 2.0
+    lambda_contrastive: 1.0
+    lambda_focal: 0.5
+    
+  # Optimization
+  optimizer: "adamw"
+  gradient_clip: 1.0
+
+# Data Configuration
+data:
+  image_size: [224, 224]  # Resize from 4288x2848
+  crop_size: [224, 224]
+  mean: [0.485, 0.456, 0.406]
+  std: [0.229, 0.224, 0.225]
+  
+  # Augmentation
+  augmentation:
+    horizontal_flip: 0.5
+    rotation: 15
+    color_jitter:
+      brightness: 0.2
+      contrast: 0.2
+      saturation: 0.1
+      hue: 0.05
+    gaussian_blur: 0.1
+    random_erasing: 0.1
+
+# Validation Configuration
+validation:
+  split_ratio: 0.2
+  metrics: ["accuracy", "precision", "recall", "f1", "auc", "eer"]
+  save_best: true
+
+# Paths
+paths:
+  data_root: "./dataset"
+  output_dir: "./outputs"
+  checkpoint_dir: "./checkpoints"
+  log_dir: "./logs"
+
+# Logging
+logging:
+  use_wandb: false
+  project_name: "twin_verification"
+  log_interval: 10
+  save_interval: 5
