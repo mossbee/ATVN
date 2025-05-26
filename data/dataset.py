@@ -1,218 +1,385 @@
 import os
 import json
 import random
+from typing import List, Tuple, Dict, Any
 from PIL import Image
 import torch
 from torch.utils.data import Dataset, DataLoader
 import torchvision.transforms as transforms
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
-import cv2
 import numpy as np
 
 
 class TwinDataset(Dataset):
-    """Dataset for identical twin verification"""
+    """Dataset for identical twin verification."""
     
-    def __init__(self, data_root, pairs_file, mode='train', config=None, transform=None):
-        self.data_root = data_root
-        self.mode = mode
-        self.config = config
-        self.transform = transform
+    def __init__(
+        self,
+        dataset_root: str,
+        pairs_file: str,
+        split: str = 'train',
+        image_size: Tuple[int, int] = (224, 224),
+        augmentation_config: Dict[str, Any] = None,
+        **kwargs
+    ):
+        """
+        Args:
+            dataset_root: Root directory containing image folders
+            pairs_file: JSON file containing twin pairs
+            split: 'train', 'val', or 'test'
+            image_size: Target image size (H, W)
+            augmentation_config: Data augmentation configuration
+        """
+        self.dataset_root = dataset_root
+        self.image_size = image_size
+        self.split = split
         
-        # Load pairs
+        # Load twin pairs
         with open(pairs_file, 'r') as f:
             self.twin_pairs = json.load(f)
-            
-        # Get all folder names
-        self.all_folders = []
-        for root, dirs, files in os.walk(data_root):
-            if any(f.endswith(('.jpg', '.jpeg', '.png')) for f in files):
-                folder_name = os.path.basename(root)
-                self.all_folders.append(folder_name)
         
-        # Create twin pair mapping
-        self.twin_dict = {}
-        for pair in self.twin_pairs:
-            self.twin_dict[pair[0]] = pair[1]
-            self.twin_dict[pair[1]] = pair[0]
-            
-        # Generate training pairs
-        self.pairs = self._generate_pairs()
+        # Get all image folders
+        self.image_folders = [d for d in os.listdir(dataset_root) 
+                             if os.path.isdir(os.path.join(dataset_root, d))]
         
-    def _generate_pairs(self):
-        """Generate positive and negative pairs"""
+        # Create folder to images mapping
+        self.folder_images = {}
+        for folder in self.image_folders:
+            folder_path = os.path.join(dataset_root, folder)
+            images = [f for f in os.listdir(folder_path) 
+                     if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
+            self.folder_images[folder] = images
+        
+        # Create positive and negative pairs for training
+        self.pairs = self._create_pairs()
+        
+        # Setup transforms
+        self.transform = self._get_transforms(augmentation_config)
+        
+    def _create_pairs(self) -> List[Tuple[str, str, int]]:
+        """Create positive and negative pairs."""
         pairs = []
         
-        # Generate positive pairs (twins)
+        # Positive pairs (twins)
         for twin_pair in self.twin_pairs:
             folder1, folder2 = twin_pair
-            
-            # Get images from both folders
-            images1 = self._get_images_from_folder(folder1)
-            images2 = self._get_images_from_folder(folder2)
-            
-            # Create positive pairs
-            for img1 in images1:
-                for img2 in images2:
-                    pairs.append((img1, img2, 1))  # 1 for twins
-                    
-        # Generate negative pairs (non-twins)
-        non_twin_folders = [f for f in self.all_folders 
-                           if f not in [item for pair in self.twin_pairs for item in pair]]
+            if folder1 in self.folder_images and folder2 in self.folder_images:
+                # Create multiple positive pairs
+                for _ in range(min(5, len(self.folder_images[folder1]), len(self.folder_images[folder2]))):
+                    img1 = random.choice(self.folder_images[folder1])
+                    img2 = random.choice(self.folder_images[folder2])
+                    pairs.append((f"{folder1}/{img1}", f"{folder2}/{img2}", 1))
         
-        # Add negative pairs from twin folders with non-twin folders
+        # Negative pairs (non-twins)
+        twin_folders = set()
         for twin_pair in self.twin_pairs:
-            for twin_folder in twin_pair:
-                twin_images = self._get_images_from_folder(twin_folder)
-                
-                # Sample random non-twin folders
-                sampled_folders = random.sample(non_twin_folders, 
-                                              min(5, len(non_twin_folders)))
-                
-                for non_twin_folder in sampled_folders:
-                    non_twin_images = self._get_images_from_folder(non_twin_folder)
-                    
-                    # Create negative pairs
-                    for twin_img in twin_images[:2]:  # Limit to avoid too many pairs
-                        for non_twin_img in non_twin_images[:2]:
-                            pairs.append((twin_img, non_twin_img, 0))  # 0 for non-twins
+            twin_folders.update(twin_pair)
+        
+        non_twin_folders = [f for f in self.image_folders if f not in twin_folders]
+        
+        # Create negative pairs (equal number to positive pairs)
+        num_negatives = len(pairs)
+        for _ in range(num_negatives):
+            # Random two different folders
+            folder1, folder2 = random.sample(self.image_folders, 2)
+            
+            # Ensure they're not twins
+            is_twin_pair = any(set([folder1, folder2]) == set(twin_pair) 
+                             for twin_pair in self.twin_pairs)
+            if not is_twin_pair:
+                img1 = random.choice(self.folder_images[folder1])
+                img2 = random.choice(self.folder_images[folder2])
+                pairs.append((f"{folder1}/{img1}", f"{folder2}/{img2}", 0))
         
         # Shuffle pairs
         random.shuffle(pairs)
-        
         return pairs
     
-    def _get_images_from_folder(self, folder_name):
-        """Get all image paths from a folder"""
-        folder_path = os.path.join(self.data_root, folder_name)
-        images = []
+    def _get_transforms(self, aug_config: Dict[str, Any] = None):
+        """Get image transforms based on split and config."""
+        if aug_config is None:
+            aug_config = {}
         
-        if os.path.exists(folder_path):
-            for file in os.listdir(folder_path):
-                if file.lower().endswith(('.jpg', '.jpeg', '.png')):
-                    images.append(os.path.join(folder_path, file))
-                    
-        return images
+        if self.split == 'train':
+            transform = A.Compose([
+                A.Resize(height=self.image_size[0], width=self.image_size[1]),
+                A.HorizontalFlip(p=aug_config.get('horizontal_flip', 0.5)),
+                A.Rotate(limit=aug_config.get('rotation', 15), p=0.5),
+                A.ColorJitter(
+                    brightness=aug_config.get('color_jitter', 0.2),
+                    contrast=aug_config.get('color_jitter', 0.2),
+                    saturation=aug_config.get('color_jitter', 0.2),
+                    hue=aug_config.get('color_jitter', 0.1),
+                    p=0.5
+                ),
+                A.GaussianBlur(blur_limit=3, p=aug_config.get('gaussian_blur', 0.1)),
+                A.Normalize(
+                    mean=aug_config.get('normalize_mean', [0.485, 0.456, 0.406]),
+                    std=aug_config.get('normalize_std', [0.229, 0.224, 0.225])
+                ),
+                ToTensorV2()
+            ])
+        else:
+            transform = A.Compose([
+                A.Resize(height=self.image_size[0], width=self.image_size[1]),
+                A.Normalize(
+                    mean=aug_config.get('normalize_mean', [0.485, 0.456, 0.406]),
+                    std=aug_config.get('normalize_std', [0.229, 0.224, 0.225])
+                ),
+                ToTensorV2()
+            ])
+        
+        return transform
     
     def __len__(self):
         return len(self.pairs)
     
     def __getitem__(self, idx):
-        img_path1, img_path2, label = self.pairs[idx]
+        img1_path, img2_path, label = self.pairs[idx]
         
         # Load images
-        image1 = self._load_image(img_path1)
-        image2 = self._load_image(img_path2)
+        img1 = Image.open(os.path.join(self.dataset_root, img1_path)).convert('RGB')
+        img2 = Image.open(os.path.join(self.dataset_root, img2_path)).convert('RGB')
+        
+        # Convert to numpy for albumentations
+        img1 = np.array(img1)
+        img2 = np.array(img2)
         
         # Apply transforms
         if self.transform:
-            image1 = self.transform(image1)
-            image2 = self.transform(image2)
+            img1 = self.transform(image=img1)['image']
+            img2 = self.transform(image=img2)['image']
         
         return {
-            'image1': image1,
-            'image2': image2,
-            'label': torch.tensor(label, dtype=torch.long),
-            'path1': img_path1,
-            'path2': img_path2
+            'image1': img1,
+            'image2': img2,
+            'label': torch.tensor(label, dtype=torch.float32),
+            'path1': img1_path,
+            'path2': img2_path
         }
-    
-    def _load_image(self, img_path):
-        """Load and preprocess image"""
-        try:
-            image = cv2.imread(img_path)
-            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-            return image
-        except Exception as e:
-            print(f"Error loading image {img_path}: {e}")
-            # Return a black image as fallback
-            return np.zeros((224, 224, 3), dtype=np.uint8)
 
 
-def get_transforms(config, mode='train'):
-    """Get data transforms based on configuration"""
+def create_data_loaders(config: Dict[str, Any]) -> Tuple[DataLoader, DataLoader, DataLoader]:
+    """Create train, validation, and test data loaders."""
     
-    if mode == 'train':
-        transform = A.Compose([
-            A.Resize(config['data']['image_size'][0], config['data']['image_size'][1]),
-            A.HorizontalFlip(p=config['data']['augmentation']['horizontal_flip']),
-            A.Rotate(limit=config['data']['augmentation']['rotation'], p=0.5),
-            A.ColorJitter(
-                brightness=config['data']['augmentation']['color_jitter']['brightness'],
-                contrast=config['data']['augmentation']['color_jitter']['contrast'],
-                saturation=config['data']['augmentation']['color_jitter']['saturation'],
-                hue=config['data']['augmentation']['color_jitter']['hue'],
-                p=0.5
-            ),
-            A.GaussianBlur(blur_limit=(3, 7), p=config['data']['augmentation']['gaussian_blur']),
-            A.CoarseDropout(
-                max_holes=8, max_height=32, max_width=32,
-                p=config['data']['augmentation']['random_erasing']
-            ),
-            A.Normalize(
-                mean=config['data']['mean'],
-                std=config['data']['std']
-            ),
-            ToTensorV2()
-        ])
-    else:
-        transform = A.Compose([
-            A.Resize(config['data']['image_size'][0], config['data']['image_size'][1]),
-            A.Normalize(
-                mean=config['data']['mean'],
-                std=config['data']['std']
-            ),
-            ToTensorV2()
-        ])
+    # Split twin pairs for train/val/test
+    with open(config['data']['pairs_file'], 'r') as f:
+        all_pairs = json.load(f)
     
-    return transform
-
-
-def create_dataloaders(config, data_root, pairs_file):
-    """Create train and validation dataloaders"""
+    random.shuffle(all_pairs)
     
-    # Get transforms
-    train_transform = get_transforms(config, 'train')
-    val_transform = get_transforms(config, 'val')
+    train_split = config['data']['train_split']
+    val_split = config['data']['val_split']
     
-    # Create full dataset
-    full_dataset = TwinDataset(
-        data_root=data_root,
-        pairs_file=pairs_file,
-        mode='train',
-        config=config,
-        transform=train_transform
+    n_total = len(all_pairs)
+    n_train = int(n_total * train_split)
+    n_val = int(n_total * val_split)
+    
+    train_pairs = all_pairs[:n_train]
+    val_pairs = all_pairs[n_train:n_train + n_val]
+    test_pairs = all_pairs[n_train + n_val:]
+    
+    # Create temporary pair files for each split
+    import tempfile
+    train_file = tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False)
+    val_file = tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False)
+    test_file = tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False)
+    
+    json.dump(train_pairs, train_file)
+    json.dump(val_pairs, val_file)
+    json.dump(test_pairs, test_file)
+    
+    train_file.close()
+    val_file.close() 
+    test_file.close()
+    
+    # Create datasets
+    train_dataset = TwinDataset(
+        dataset_root=config['data']['dataset_root'],
+        pairs_file=train_file.name,
+        split='train',
+        image_size=config['data']['image_size'],
+        augmentation_config=config.get('augmentation', {})
     )
     
-    # Split dataset
-    val_split = config['validation']['split_ratio']
-    dataset_size = len(full_dataset)
-    val_size = int(val_split * dataset_size)
-    train_size = dataset_size - val_size
-    
-    train_dataset, val_dataset = torch.utils.data.random_split(
-        full_dataset, [train_size, val_size]
+    val_dataset = TwinDataset(
+        dataset_root=config['data']['dataset_root'],
+        pairs_file=val_file.name,
+        split='val',
+        image_size=config['data']['image_size'],
+        augmentation_config=config.get('augmentation', {})
     )
     
-    # Update transform for validation dataset
-    val_dataset.dataset.transform = val_transform
+    test_dataset = TwinDataset(
+        dataset_root=config['data']['dataset_root'],
+        pairs_file=test_file.name,
+        split='test',
+        image_size=config['data']['image_size'],
+        augmentation_config=config.get('augmentation', {})
+    )
     
-    # Create dataloaders
+    # Create data loaders
     train_loader = DataLoader(
         train_dataset,
         batch_size=config['training']['batch_size'],
         shuffle=True,
-        num_workers=4,
-        pin_memory=True
+        num_workers=config['data']['num_workers'],
+        pin_memory=config['data']['pin_memory']
     )
     
     val_loader = DataLoader(
         val_dataset,
         batch_size=config['training']['batch_size'],
         shuffle=False,
-        num_workers=4,
-        pin_memory=True
+        num_workers=config['data']['num_workers'],
+        pin_memory=config['data']['pin_memory']
     )
     
-    return train_loader, val_loader
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=config['training']['batch_size'],
+        shuffle=False,
+        num_workers=config['data']['num_workers'],
+        pin_memory=config['data']['pin_memory']
+    )
+    
+    # Clean up temporary files
+    os.unlink(train_file.name)
+    os.unlink(val_file.name)
+    os.unlink(test_file.name)
+    
+    return train_loader, val_loader, test_loader
+
+
+class TripletDataset(Dataset):
+    """Dataset for triplet loss training."""
+    
+    def __init__(
+        self,
+        dataset_root: str,
+        pairs_file: str,
+        image_size: Tuple[int, int] = (224, 224),
+        augmentation_config: Dict[str, Any] = None,
+        triplets_per_epoch: int = 10000
+    ):
+        """
+        Args:
+            dataset_root: Root directory containing image folders
+            pairs_file: JSON file containing twin pairs
+            image_size: Target image size (H, W)
+            augmentation_config: Data augmentation configuration
+            triplets_per_epoch: Number of triplets to generate per epoch
+        """
+        self.dataset_root = dataset_root
+        self.image_size = image_size
+        self.triplets_per_epoch = triplets_per_epoch
+        
+        # Load twin pairs
+        with open(pairs_file, 'r') as f:
+            self.twin_pairs = json.load(f)
+        
+        # Get all image folders
+        self.image_folders = [d for d in os.listdir(dataset_root) 
+                             if os.path.isdir(os.path.join(dataset_root, d))]
+        
+        # Create folder to images mapping
+        self.folder_images = {}
+        for folder in self.image_folders:
+            folder_path = os.path.join(dataset_root, folder)
+            images = [f for f in os.listdir(folder_path) 
+                     if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
+            self.folder_images[folder] = images
+        
+        # Setup transforms
+        self.transform = self._get_transforms(augmentation_config)
+        
+        # Generate triplets
+        self.triplets = self._generate_triplets()
+    
+    def _generate_triplets(self) -> List[Tuple[str, str, str]]:
+        """Generate anchor-positive-negative triplets."""
+        triplets = []
+        
+        for _ in range(self.triplets_per_epoch):
+            # Choose a random twin pair for anchor and positive
+            twin_pair = random.choice(self.twin_pairs)
+            anchor_folder, positive_folder = twin_pair
+            
+            if (anchor_folder not in self.folder_images or 
+                positive_folder not in self.folder_images):
+                continue
+            
+            # Select random images from anchor and positive folders
+            anchor_img = random.choice(self.folder_images[anchor_folder])
+            positive_img = random.choice(self.folder_images[positive_folder])
+            
+            # Select negative image (not from twin pair)
+            negative_folders = [f for f in self.image_folders 
+                              if f not in twin_pair]
+            negative_folder = random.choice(negative_folders)
+            negative_img = random.choice(self.folder_images[negative_folder])
+            
+            triplets.append((
+                f"{anchor_folder}/{anchor_img}",
+                f"{positive_folder}/{positive_img}",
+                f"{negative_folder}/{negative_img}"
+            ))
+        
+        return triplets
+    
+    def _get_transforms(self, aug_config: Dict[str, Any] = None):
+        """Get image transforms."""
+        if aug_config is None:
+            aug_config = {}
+        
+        transform = A.Compose([
+            A.Resize(height=self.image_size[0], width=self.image_size[1]),
+            A.HorizontalFlip(p=aug_config.get('horizontal_flip', 0.5)),
+            A.Rotate(limit=aug_config.get('rotation', 15), p=0.5),
+            A.ColorJitter(
+                brightness=aug_config.get('color_jitter', 0.2),
+                contrast=aug_config.get('color_jitter', 0.2),
+                saturation=aug_config.get('color_jitter', 0.2),
+                hue=aug_config.get('color_jitter', 0.1),
+                p=0.5
+            ),
+            A.Normalize(
+                mean=aug_config.get('normalize_mean', [0.485, 0.456, 0.406]),
+                std=aug_config.get('normalize_std', [0.229, 0.224, 0.225])
+            ),
+            ToTensorV2()
+        ])
+        
+        return transform
+    
+    def __len__(self):
+        return len(self.triplets)
+    
+    def __getitem__(self, idx):
+        anchor_path, positive_path, negative_path = self.triplets[idx]
+        
+        # Load images
+        anchor = Image.open(os.path.join(self.dataset_root, anchor_path)).convert('RGB')
+        positive = Image.open(os.path.join(self.dataset_root, positive_path)).convert('RGB')
+        negative = Image.open(os.path.join(self.dataset_root, negative_path)).convert('RGB')
+        
+        # Convert to numpy for albumentations
+        anchor = np.array(anchor)
+        positive = np.array(positive)
+        negative = np.array(negative)
+        
+        # Apply transforms
+        if self.transform:
+            anchor = self.transform(image=anchor)['image']
+            positive = self.transform(image=positive)['image']
+            negative = self.transform(image=negative)['image']
+        
+        return {
+            'anchor': anchor,
+            'positive': positive,
+            'negative': negative,
+            'anchor_path': anchor_path,
+            'positive_path': positive_path,
+            'negative_path': negative_path
+        }

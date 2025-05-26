@@ -1,261 +1,354 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from facenet_pytorch import InceptionResnetV1
-import timm
-from einops import rearrange
+from typing import Dict, Any, Optional, Tuple
+import math
+
+from .backbone import BackboneFactory, FeatureExtractor
+from .attention import TwinAttentionModule, AdaptiveFeatureFusion
 
 
-class MultiScaleAttention(nn.Module):
-    """Multi-scale attention module for fine-grained feature extraction"""
+class ATVNModel(nn.Module):
+    """
+    Attention-Enhanced Twin Verification Network (ATVN).
     
-    def __init__(self, in_channels, scales=[1, 2, 4], dropout=0.1):
-        super().__init__()
-        self.scales = scales
-        self.in_channels = in_channels
-        
-        # Channel attention
-        self.channel_attention = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(in_channels, in_channels // 16, 1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(in_channels // 16, in_channels, 1),
-            nn.Sigmoid()
-        )
-        
-        # Spatial attention for each scale
-        self.spatial_attentions = nn.ModuleList([
-            nn.Sequential(
-                nn.Conv2d(2, 1, kernel_size=7, padding=3),
-                nn.Sigmoid()
-            ) for _ in scales
-        ])
-        
-        # Scale fusion
-        self.scale_fusion = nn.Conv2d(
-            in_channels * len(scales), in_channels, 1
-        )
-        
-        self.dropout = nn.Dropout2d(dropout)
-        
-    def forward(self, x):
-        batch_size, channels, height, width = x.shape
-        
-        # Channel attention
-        channel_att = self.channel_attention(x)
-        x_channel = x * channel_att
-        
-        # Multi-scale spatial attention
-        scale_features = []
-        
-        for i, scale in enumerate(self.scales):
-            if scale == 1:
-                scale_x = x_channel
-            else:
-                # Downsample
-                scale_x = F.adaptive_avg_pool2d(x_channel, 
-                                              (height // scale, width // scale))
-            
-            # Spatial attention
-            avg_pool = torch.mean(scale_x, dim=1, keepdim=True)
-            max_pool, _ = torch.max(scale_x, dim=1, keepdim=True)
-            spatial_input = torch.cat([avg_pool, max_pool], dim=1)
-            spatial_att = self.spatial_attentions[i](spatial_input)
-            
-            # Apply spatial attention
-            scale_x = scale_x * spatial_att
-            
-            # Upsample back to original size
-            if scale != 1:
-                scale_x = F.interpolate(scale_x, size=(height, width), 
-                                      mode='bilinear', align_corners=False)
-            
-            scale_features.append(scale_x)
-        
-        # Fuse multi-scale features
-        fused = torch.cat(scale_features, dim=1)
-        fused = self.scale_fusion(fused)
-        fused = self.dropout(fused)
-        
-        return fused
-
-
-class AdaptiveFusion(nn.Module):
-    """Adaptive feature fusion module"""
+    This model combines pre-trained face recognition backbones with attention mechanisms
+    to distinguish between identical twins by focusing on fine-grained differences.
+    """
     
-    def __init__(self, attention_dim, pretrained_dim, output_dim):
-        super().__init__()
-        self.attention_dim = attention_dim
-        self.pretrained_dim = pretrained_dim
-        self.output_dim = output_dim
-        
-        # Feature projections
-        self.attention_proj = nn.Linear(attention_dim, output_dim)
-        self.pretrained_proj = nn.Linear(pretrained_dim, output_dim)
-        
-        # Fusion weights network
-        self.fusion_gate = nn.Sequential(
-            nn.Linear(attention_dim + pretrained_dim, output_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(output_dim, 2),
-            nn.Softmax(dim=-1)
-        )
-        
-        # Output projection
-        self.output_proj = nn.Sequential(
-            nn.Linear(output_dim, output_dim),
-            nn.LayerNorm(output_dim),
-            nn.ReLU(inplace=True)
-        )
-        
-    def forward(self, attention_feat, pretrained_feat):
-        # Project features to same dimension
-        att_proj = self.attention_proj(attention_feat)
-        pre_proj = self.pretrained_proj(pretrained_feat)
-        
-        # Compute fusion weights
-        concat_feat = torch.cat([attention_feat, pretrained_feat], dim=-1)
-        weights = self.fusion_gate(concat_feat)
-        
-        # Weighted fusion
-        fused = weights[:, 0:1] * att_proj + weights[:, 1:2] * pre_proj
-        
-        # Output projection
-        output = self.output_proj(fused)
-        
-        return output
-
-
-class ATVN(nn.Module):
-    """Attention-Enhanced Twin Verification Network"""
-    
-    def __init__(self, config):
+    def __init__(self, config: Dict[str, Any]):
         super().__init__()
         self.config = config
+        self.embedding_dim = config['model']['embedding_dim']
+        self.attention_dim = config['model']['attention_dim']
         
-        # Backbone selection
-        if config['model']['backbone'] == 'facenet':
-            self.backbone = InceptionResnetV1(pretrained='vggface2')
-            backbone_dim = 512
-        else:
-            # Alternative: Use ResNet backbone
-            self.backbone = timm.create_model('resnet50', pretrained=True, num_classes=0)
-            backbone_dim = 2048
-            
-        # Freeze backbone initially (can be unfrozen later)
-        for param in self.backbone.parameters():
-            param.requires_grad = False
-            
-        # Attention branch
-        self.attention_conv = nn.Sequential(
-            nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3),
-            nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(kernel_size=3, stride=2, padding=1),
-            
-            # ResNet-like blocks
-            self._make_layer(64, 128, 2),
-            self._make_layer(128, 256, 2),
-            self._make_layer(256, 512, 2),
-        )
+        # Create backbone
+        self.backbone = BackboneFactory.create_backbone(config)
         
-        # Multi-scale attention
-        self.attention_module = MultiScaleAttention(
-            in_channels=512,
-            scales=config['model']['attention']['scales'],
-            dropout=config['model']['attention']['dropout']
+        # Feature extractor with multi-scale support
+        self.feature_extractor = FeatureExtractor(self.backbone)
+        
+        # Twin attention module
+        self.twin_attention = TwinAttentionModule(
+            in_channels=self._get_feature_channels(),
+            attention_dim=self.attention_dim,
+            num_heads=config['model']['num_attention_heads'],
+            dropout=config['model']['dropout']
         )
         
         # Global average pooling for attention features
         self.attention_pool = nn.AdaptiveAvgPool2d(1)
         
-        # Feature fusion
-        self.fusion = AdaptiveFusion(
-            attention_dim=512,
-            pretrained_dim=backbone_dim,
-            output_dim=config['model']['fusion']['output_dim']
+        # Feature fusion module
+        self.feature_fusion = AdaptiveFeatureFusion(
+            global_dim=self.embedding_dim,
+            attention_dim=self.attention_dim,
+            output_dim=self.embedding_dim
         )
         
-        # Verification head
-        head_dims = config['model']['head']['hidden_dims']
-        layers = []
-        in_dim = config['model']['fusion']['output_dim']
-        
-        for hidden_dim in head_dims:
-            layers.extend([
-                nn.Linear(in_dim, hidden_dim),
-                nn.BatchNorm1d(hidden_dim),
-                nn.ReLU(inplace=True),
-                nn.Dropout(config['model']['head']['dropout'])
-            ])
-            in_dim = hidden_dim
-            
-        layers.append(nn.Linear(in_dim, 1))  # Binary classification
-        self.verification_head = nn.Sequential(*layers)
-        
-    def _make_layer(self, in_channels, out_channels, stride):
-        """Create a ResNet-like layer"""
-        return nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, kernel_size=3, 
-                     stride=stride, padding=1, bias=False),
-            nn.BatchNorm2d(out_channels),
+        # Similarity computation
+        self.similarity_head = nn.Sequential(
+            nn.Linear(self.embedding_dim, self.embedding_dim // 2),
             nn.ReLU(inplace=True),
-            nn.Conv2d(out_channels, out_channels, kernel_size=3, 
-                     stride=1, padding=1, bias=False),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True)
+            nn.Dropout(config['model']['dropout']),
+            nn.Linear(self.embedding_dim // 2, 1),
+            nn.Sigmoid()
         )
         
-    def extract_features(self, x):
-        """Extract features from a single image"""
-        # Attention branch
-        att_feat = self.attention_conv(x)
-        att_feat = self.attention_module(att_feat)
-        att_feat = self.attention_pool(att_feat).flatten(1)
+        # L2 normalization for embeddings
+        self.l2_norm = nn.functional.normalize
         
-        # Pre-trained branch
-        if self.config['model']['backbone'] == 'facenet':
-            pre_feat = self.backbone(x)
+        # Initialize weights
+        self._initialize_weights()
+    
+    def _get_feature_channels(self) -> int:
+        """Get the number of channels in feature maps from backbone."""
+        # This is a simple heuristic - in practice, you might want to
+        # run a forward pass to determine this automatically
+        backbone_type = self.config['model']['backbone'].lower()
+        if 'facenet' in backbone_type:
+            return 1792  # InceptionResnetV1
+        elif 'resnet' in backbone_type:
+            return 2048  # ResNet50/101
+        elif 'efficientnet' in backbone_type:
+            return 1280  # EfficientNet-B0
         else:
-            pre_feat = self.backbone(x)
-            
-        # Feature fusion
-        fused_feat = self.fusion(att_feat, pre_feat)
+            return 512  # Default
+    
+    def _initialize_weights(self):
+        """Initialize model weights."""
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+    
+    def extract_features(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Extract global and local features from input image.
         
-        return fused_feat
+        Args:
+            x: Input image tensor (B, 3, H, W)
+        Returns:
+            global_embeddings: Global face embeddings (B, embedding_dim)
+            feature_maps: Feature maps for attention (B, C, H', W')
+        """
+        # Extract features using backbone
+        global_embeddings, feature_maps, _ = self.feature_extractor(x)
         
-    def forward(self, x1, x2):
-        """Forward pass for twin verification"""
+        # L2 normalize global embeddings
+        global_embeddings = self.l2_norm(global_embeddings, p=2, dim=1)
+        
+        return global_embeddings, feature_maps
+    
+    def compute_attention_features(
+        self, 
+        feature_maps1: torch.Tensor, 
+        feature_maps2: torch.Tensor
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """
+        Compute attention-enhanced features for twin comparison.
+        
+        Args:
+            feature_maps1: Feature maps from first image (B, C, H, W)
+            feature_maps2: Feature maps from second image (B, C, H, W)
+        Returns:
+            attention_features: Attention-enhanced features (B, attention_dim)
+            attention_info: Dictionary containing attention maps
+        """
+        # Apply twin attention module
+        (enhanced_f1, enhanced_f2), attention_info = self.twin_attention(
+            feature_maps1, feature_maps2
+        )
+        
+        # Global pooling of attention features
+        attn_f1 = self.attention_pool(enhanced_f1).squeeze(-1).squeeze(-1)
+        attn_f2 = self.attention_pool(enhanced_f2).squeeze(-1).squeeze(-1)
+        
+        # Combine attention features (element-wise absolute difference)
+        attention_features = torch.abs(attn_f1 - attn_f2)
+        
+        return attention_features, attention_info
+    
+    def forward(
+        self, 
+        image1: torch.Tensor, 
+        image2: torch.Tensor,
+        return_attention: bool = False
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Forward pass for twin verification.
+        
+        Args:
+            image1: First image (B, 3, H, W)
+            image2: Second image (B, 3, H, W)
+            return_attention: Whether to return attention maps
+        Returns:
+            Dictionary containing:
+                - similarity: Similarity score (B, 1)
+                - embeddings1: Embeddings for image1 (B, embedding_dim)
+                - embeddings2: Embeddings for image2 (B, embedding_dim)
+                - fused_features: Fused global and attention features (B, embedding_dim)
+                - attention_info: Attention maps (if return_attention=True)
+        """
         # Extract features for both images
-        feat1 = self.extract_features(x1)
-        feat2 = self.extract_features(x2)
+        global_emb1, feature_maps1 = self.extract_features(image1)
+        global_emb2, feature_maps2 = self.extract_features(image2)
         
-        # Compute similarity features
-        # Concatenate features along with their difference and element-wise product
-        diff = torch.abs(feat1 - feat2)
-        prod = feat1 * feat2
+        # Compute attention features
+        attention_features, attention_info = self.compute_attention_features(
+            feature_maps1, feature_maps2
+        )
         
-        # Combine all similarity features
-        similarity_feat = torch.cat([feat1, feat2, diff, prod], dim=1)
+        # Combine global embeddings (element-wise absolute difference)
+        global_diff = torch.abs(global_emb1 - global_emb2)
         
-        # Expand verification head to handle concatenated features
-        if not hasattr(self, '_head_adjusted'):
-            input_dim = similarity_feat.shape[1]
-            first_layer = self.verification_head[0]
-            if first_layer.in_features != input_dim:
-                # Recreate first layer with correct input dimension
-                new_first_layer = nn.Linear(input_dim, first_layer.out_features)
-                nn.init.xavier_uniform_(new_first_layer.weight)
-                nn.init.zeros_(new_first_layer.bias)
-                self.verification_head[0] = new_first_layer
-            self._head_adjusted = True
+        # Fuse global and attention features
+        fused_features = self.feature_fusion(global_diff, attention_features)
         
-        # Verification prediction
-        similarity_score = self.verification_head(similarity_feat)
+        # Compute similarity score
+        similarity = self.similarity_head(fused_features)
         
-        return similarity_score.squeeze(-1)
+        # Prepare output
+        output = {
+            'similarity': similarity,
+            'embeddings1': global_emb1,
+            'embeddings2': global_emb2,
+            'fused_features': fused_features,
+            'global_diff': global_diff,
+            'attention_features': attention_features
+        }
         
-    def unfreeze_backbone(self):
-        """Unfreeze backbone for fine-tuning"""
+        if return_attention:
+            output['attention_info'] = attention_info
+        
+        return output
+    
+    def compute_similarity(
+        self, 
+        image1: torch.Tensor, 
+        image2: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Compute similarity score between two images.
+        
+        Args:
+            image1: First image (B, 3, H, W)
+            image2: Second image (B, 3, H, W)
+        Returns:
+            similarity: Similarity score (B, 1)
+        """
+        with torch.no_grad():
+            output = self.forward(image1, image2, return_attention=False)
+            return output['similarity']
+    
+    def get_embeddings(self, image: torch.Tensor) -> torch.Tensor:
+        """
+        Get face embeddings for a single image.
+        
+        Args:
+            image: Input image (B, 3, H, W)
+        Returns:
+            embeddings: Face embeddings (B, embedding_dim)
+        """
+        with torch.no_grad():
+            embeddings, _ = self.extract_features(image)
+            return embeddings
+    
+    def freeze_backbone(self, freeze: bool = True):
+        """Freeze or unfreeze backbone parameters."""
         for param in self.backbone.parameters():
-            param.requires_grad = True
+            param.requires_grad = not freeze
+    
+    def get_attention_maps(
+        self, 
+        image1: torch.Tensor, 
+        image2: torch.Tensor
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Get attention maps for visualization.
+        
+        Args:
+            image1: First image (1, 3, H, W)
+            image2: Second image (1, 3, H, W)
+        Returns:
+            Dictionary of attention maps
+        """
+        with torch.no_grad():
+            output = self.forward(image1, image2, return_attention=True)
+            return output['attention_info']
+    
+    def save_checkpoint(self, filepath: str, epoch: int, optimizer_state: Optional[Dict] = None):
+        """Save model checkpoint."""
+        checkpoint = {
+            'epoch': epoch,
+            'model_state_dict': self.state_dict(),
+            'config': self.config,
+            'model_class': self.__class__.__name__
+        }
+        
+        if optimizer_state is not None:
+            checkpoint['optimizer_state_dict'] = optimizer_state
+        
+        torch.save(checkpoint, filepath)
+    
+    @classmethod
+    def load_from_checkpoint(cls, filepath: str, map_location: str = 'cpu'):
+        """Load model from checkpoint."""
+        checkpoint = torch.load(filepath, map_location=map_location)
+        
+        # Create model
+        model = cls(checkpoint['config'])
+        
+        # Load state dict
+        model.load_state_dict(checkpoint['model_state_dict'])
+        
+        return model, checkpoint.get('epoch', 0)
+
+
+class ATVNLoss(nn.Module):
+    """Combined loss function for ATVN training."""
+    
+    def __init__(self, config: Dict[str, Any]):
+        super().__init__()
+        self.config = config
+        
+        # Loss weights
+        self.triplet_weight = config['loss']['triplet_weight']
+        self.center_weight = config['loss']['center_weight']
+        self.attention_reg_weight = config['loss']['attention_reg_weight']
+        
+        # Individual losses
+        self.bce_loss = nn.BCELoss()
+        self.triplet_loss = nn.TripletMarginLoss(
+            margin=config['loss']['triplet_margin']
+        )
+        self.mse_loss = nn.MSELoss()
+    
+    def forward(
+        self, 
+        predictions: Dict[str, torch.Tensor], 
+        labels: torch.Tensor,
+        embeddings1: torch.Tensor = None,
+        embeddings2: torch.Tensor = None
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Compute combined loss.
+        
+        Args:
+            predictions: Model predictions
+            labels: Ground truth labels (B,)
+            embeddings1: Embeddings for first image (for triplet loss)
+            embeddings2: Embeddings for second image (for triplet loss)
+        Returns:
+            Dictionary of losses
+        """
+        # Binary cross-entropy loss for similarity
+        similarity = predictions['similarity'].squeeze()
+        bce_loss = self.bce_loss(similarity, labels)
+        
+        # Center loss (encourage similar embeddings for same twins)
+        center_loss = torch.tensor(0.0, device=labels.device)
+        if self.center_weight > 0 and embeddings1 is not None and embeddings2 is not None:
+            positive_mask = labels == 1
+            if positive_mask.sum() > 0:
+                pos_emb1 = embeddings1[positive_mask]
+                pos_emb2 = embeddings2[positive_mask]
+                center_loss = self.mse_loss(pos_emb1, pos_emb2)
+        
+        # Attention regularization (encourage sparse attention)
+        attention_reg_loss = torch.tensor(0.0, device=labels.device)
+        if 'attention_info' in predictions and self.attention_reg_weight > 0:
+            attention_info = predictions['attention_info']
+            for key, attn_maps in attention_info.items():
+                if isinstance(attn_maps, torch.Tensor):
+                    # L1 regularization on attention maps
+                    attention_reg_loss += torch.mean(torch.abs(attn_maps))
+                elif isinstance(attn_maps, list):
+                    for attn_map in attn_maps:
+                        attention_reg_loss += torch.mean(torch.abs(attn_map))
+        
+        # Total loss
+        total_loss = (bce_loss + 
+                     self.center_weight * center_loss + 
+                     self.attention_reg_weight * attention_reg_loss)
+        
+        return {
+            'total_loss': total_loss,
+            'bce_loss': bce_loss,
+            'center_loss': center_loss,
+            'attention_reg_loss': attention_reg_loss
+        }
+
+
+def create_model(config: Dict[str, Any]) -> Tuple[ATVNModel, ATVNLoss]:
+    """Create ATVN model and loss function."""
+    model = ATVNModel(config)
+    loss_fn = ATVNLoss(config)
+    
+    return model, loss_fn
